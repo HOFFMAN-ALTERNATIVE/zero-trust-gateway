@@ -1,0 +1,67 @@
+# Zero-trust gateway demo: mock OIDC issuer + gateway + two mTLS-only upstreams.
+#   docker compose up --build
+#   open http://localhost:8080/            (browser login via the mock issuer)
+#   ./scripts/smoke.sh                     (API walkthrough with bearer tokens)
+# Everything here is DEMO-ONLY: fixed secrets, plain-HTTP front door, mock IdP.
+name: zero-trust-gateway
+
+x-image: &image
+  image: zero-trust-gateway:dev
+  build: .
+
+services:
+  certs:
+    <<: *image
+    entrypoint: ["/usr/local/bin/devca", "-out", "/certs", "-servers", "app,admin", "-clients", "gateway", "-validity", "24h"]
+    volumes: [certs:/certs]
+
+  mockidp:
+    <<: *image
+    entrypoint:
+      - /usr/local/bin/mockidp
+      - -listen=:9000
+      - -issuer=http://localhost:9000
+      - -redirect-uris=http://localhost:8080/_ztg/callback
+      - -alg=ES256
+    environment:
+      MOCKIDP_CLIENT_SECRET: demo-client-secret
+    ports: ["9000:9000"]
+
+  app:
+    <<: *image
+    entrypoint: ["/usr/local/bin/upstream", "-name", "app", "-cert", "/certs/app.pem", "-key", "/certs/app-key.pem", "-ca", "/certs/ca.pem"]
+    volumes: [certs:/certs:ro]
+    depends_on:
+      certs: { condition: service_completed_successfully }
+
+  admin:
+    <<: *image
+    entrypoint: ["/usr/local/bin/upstream", "-name", "admin", "-cert", "/certs/admin.pem", "-key", "/certs/admin-key.pem", "-ca", "/certs/ca.pem"]
+    volumes: [certs:/certs:ro]
+    depends_on:
+      certs: { condition: service_completed_successfully }
+
+  gateway:
+    <<: *image
+    command: ["-config", "/etc/ztg/config.yaml", "-drain-delay", "1s"]
+    environment:
+      ZTG_CLIENT_SECRET: demo-client-secret
+      # base64("demo-only-session-key-change-me!") — generate real keys with: openssl rand -base64 32
+      ZTG_SESSION_KEYS: "demo:ZGVtby1vbmx5LXNlc3Npb24ta2V5LWNoYW5nZS1tZSE="
+    volumes:
+      - certs:/certs:ro
+      - ./deploy/demo/config.yaml:/etc/ztg/config.yaml:ro
+    ports: ["8080:8080", "9090:9090"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ztgw", "-healthcheck", "http://127.0.0.1:9090/readyz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      certs: { condition: service_completed_successfully }
+      mockidp: { condition: service_started }
+      app: { condition: service_started }
+      admin: { condition: service_started }
+
+volumes:
+  certs: {}

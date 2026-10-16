@@ -1,0 +1,69 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: golangci-lint · go vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+
+  test:
+    name: unit + integration (race, real TLS) · go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.23", "1.24", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go build ./...
+      - run: go test -race -count=1 -shuffle=on -coverpkg=./internal/... -coverprofile=coverage.out -covermode=atomic ./...
+      - run: go tool cover -func=coverage.out | tail -1
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  demo:
+    name: docker-compose demo (end-to-end)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build
+      - run: ./scripts/smoke.sh
+      - name: Audit log is structured JSON
+        run: docker compose logs --no-log-prefix gateway | grep '"log":"audit"' | head -n 5 | jq -e 'select(.decision and .route and .request_id)' >/dev/null
+      - name: Graceful shutdown drains and exits cleanly
+        run: |
+          docker compose stop -t 20 gateway
+          docker compose logs --no-log-prefix gateway | grep -q '"msg":"shutdown complete"'
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps -aq gateway)")" = 0
+      - if: failure()
+        run: docker compose logs
