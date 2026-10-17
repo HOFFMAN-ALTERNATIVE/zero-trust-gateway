@@ -311,6 +311,14 @@ internal/jose     minimal JWS signer for the mock issuer and tests
 deploy/demo       demo policy
 ```
 
+## Container image
+
+Multi-arch (amd64/arm64) images are published to GitHub Container Registry on every release:
+
+```bash
+docker pull ghcr.io/hoffman-alternative/zero-trust-gateway:latest
+```
+
 ## License
 
 [MIT](LICENSE) © 2026 Herman Hoffman
