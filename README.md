@@ -7,17 +7,11 @@
 ![Prometheus](https://img.shields.io/badge/metrics-Prometheus-E6522C?logo=prometheus&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-An **identity-aware reverse proxy** in the BeyondCorp style, written in Go with
-two dependencies (`prometheus/client_golang`, `yaml.v3`). Every request is
-authenticated (OIDC bearer JWT or a short-lived signed session cookie), checked
-against a **deny-by-default per-route policy**, written to a JSON **audit log**,
-and only then forwarded — over **mutual TLS 1.3** — to the upstream, which
-receives a verified identity instead of a network location to trust.
+Put internal services behind a gateway that checks who is asking on every request, instead of trusting whoever reached the network. `ztgw` authenticates each request (OIDC bearer JWT or a 15-minute signed session cookie), evaluates a deny-by-default route policy, writes a JSON audit line, and only then forwards over mutual TLS 1.3. Upstreams receive a verified identity, never a raw token.
 
-JWT/JWKS verification, the OIDC relying party, session cookies, the policy
-engine and the dev CA are implemented from the standard library, not imported,
-and the whole thing is covered by integration tests that use real TLS
-handshakes, a real OIDC code flow and real key rotation.
+Two dependencies (`prometheus/client_golang`, `yaml.v3`). JWT/JWKS verification, the OIDC relying party with PKCE, session cookies, the policy engine and the dev CA are written on the Go standard library. Every row of the threat model below names the test that covers it; coverage across `internal/...` is 86 % and the tests use real TLS handshakes, a real OIDC code flow and real key rotation.
+
+Cost per request, measured (8 vCPU VM, Go 1.27): 31 µs to verify an RS256 token, 111 ns and zero allocations to route and evaluate policy. Requests carrying a session cookie skip signature verification entirely.
 
 ## Why
 
@@ -26,7 +20,7 @@ or one SSRF later, every internal dashboard is open. Zero trust moves the
 decision to each request:
 
 - **Identity, not IP.** Access depends on *who* (verified token claims), *what*
-  (method + path) and *which rule* allowed it — never on where the packet came from.
+  (method + path) and *which rule* allowed it, never on where the packet came from.
 - **Deny by default.** Unknown paths 404 at the gateway. Routes without allow
   rules are a config error, and so is a rule without conditions.
 - **No implicit trust behind the proxy.** Upstreams only accept TLS 1.3
@@ -57,7 +51,7 @@ decision to each request:
 ```mermaid
 flowchart LR
     U[Browser / CLI / service] -- "HTTPS (TLS at LB or ingress)" --> GW
-    subgraph GW["ztgw — zero-trust gateway"]
+    subgraph GW["ztgw: zero-trust gateway"]
         direction TB
         RID[request id + path normalisation] --> AUTHN{authenticate}
         AUTHN -- "Bearer JWT" --> JV[jwtverify<br/>alg allow-list · iss/aud/exp]
@@ -184,7 +178,7 @@ routes:
 ```
 
 Full example: [`deploy/demo/config.yaml`](deploy/demo/config.yaml). The loader is
-strict — unknown keys, rules without conditions, unknown upstreams, plaintext
+strict: unknown keys, rules without conditions, unknown upstreams, plaintext
 upstreams without `allow_plaintext`, or session keys < 32 bytes all fail
 startup (or a SIGHUP reload) with every problem listed at once.
 
@@ -204,6 +198,8 @@ the gateway (LB / ingress) and set `trusted_proxy: true` only when that hop is
 the sole way in.
 
 ## Threat model
+
+Vulnerability reporting: [SECURITY.md](SECURITY.md).
 
 Assets: upstream data and actions; session cookies; signing/session keys.
 Trust anchors: the OIDC issuer's keys, the gateway's session keys, the internal CA.
@@ -226,25 +222,27 @@ Trust anchors: the OIDC issuer's keys, the gateway's session keys, the internal 
 | Repudiation | Append-only JSON audit line per decision with subject, rule, reason, request id | `TestAuditLog` |
 
 **Out of scope / residual risk.** Revocation is bounded by token and session
-lifetime (short by design — no server-side session store to replicate). Device
+lifetime (short by design, since there is no server-side session store to replicate). Device
 posture is not evaluated (the claim matcher can consume posture claims if your
 IdP issues them). Rate limiting belongs in front of or beside the gateway (see
 [distributed-rate-limiter](https://github.com/HOFFMAN-ALTERNATIVE/distributed-rate-limiter)).
 The mock issuer and `devca` are development tools and must never be exposed.
 
-## Design decisions & trade-offs
+## Design decisions and trade-offs
+
+ADRs: [0001 standard-library crypto instead of a JOSE library](docs/adr/0001-stdlib-jwt-verification.md), [0002 stateless signed sessions](docs/adr/0002-stateless-sessions.md), [0003 YAML allow/deny rules instead of Rego or CEL](docs/adr/0003-yaml-policy-over-policy-language.md).
 
 - **Stdlib crypto over a JOSE library.** Verification is ~250 lines with one
   job: refuse everything except the few algorithms and shapes we expect. Large
   JOSE libraries carry JWE, `jku`/`x5u` header fetching and algorithm
-  negotiation — attack surface an auth gateway does not need.
+  negotiation: attack surface an auth gateway does not need.
 - **Stateless sessions.** An HMAC cookie scales horizontally with zero shared
   state; the price is no instant server-side revocation, which is why the TTL is
   short and policy is re-evaluated on every request (group changes apply at the
   next login, removed routes immediately).
 - **Explicit `deny` + `allow` instead of a policy language (Rego/CEL).** The YAML
   covers the common BeyondCorp rules, is reviewable by non-developers and has no
-  evaluation-time failure modes. 150 ns / 0 allocs per decision. A CEL backend
+  evaluation-time failure modes. About 110 ns and 0 allocs per decision. A CEL backend
   could slot in behind `policy.Evaluate` if expressions become necessary.
 - **Identity headers + mTLS, not token forwarding.** Upstreams trust a
   mutually-authenticated hop and plain headers; they never see bearer tokens
@@ -261,13 +259,13 @@ The mock issuer and `devca` are development tools and must never be exposed.
 
 ## Performance
 
-`go test -bench . ./internal/...` on an 8-vCPU Xeon VM (Go 1.24):
+`go test -run '^$' -bench 'Verify|RouteAndEvaluate' -benchmem ./internal/...` on an 8 vCPU Xeon VM, Go 1.27.2:
 
 ```
-BenchmarkVerify/RS256-8         34.6 µs/op   4008 B/op   77 allocs/op
-BenchmarkVerify/EdDSA-8         52.1 µs/op   2440 B/op   68 allocs/op
-BenchmarkVerify/ES256-8         85.7 µs/op   3656 B/op   92 allocs/op
-BenchmarkRouteAndEvaluate-8    149.3 ns/op      0 B/op    0 allocs/op
+BenchmarkVerify/RS256-8         31.1 µs/op   3077 B/op   43 allocs/op
+BenchmarkVerify/EdDSA-8         46.8 µs/op   1506 B/op   34 allocs/op
+BenchmarkVerify/ES256-8         70.8 µs/op   2692 B/op   54 allocs/op
+BenchmarkRouteAndEvaluate-8    110.6 ns/op      0 B/op    0 allocs/op
 ```
 
 Signature verification dominates; session-cookie requests skip it entirely
@@ -321,4 +319,4 @@ docker pull ghcr.io/hoffman-alternative/zero-trust-gateway:latest
 
 ## License
 
-[MIT](LICENSE) © 2026 Herman Hoffman
+[MIT](LICENSE)
